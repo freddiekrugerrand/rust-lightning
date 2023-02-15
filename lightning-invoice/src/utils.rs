@@ -203,11 +203,11 @@ where
 	for PhantomRouteHints { channels, phantom_scid, real_node_pubkey } in phantom_route_hints {
 		log_trace!(logger, "Generating phantom route hints for node {}",
 			log_pubkey!(real_node_pubkey));
-		let mut route_hints = filter_channels(channels, amt_msat, &logger);
+		let mut route_hints = sort_and_filter_channels(channels, amt_msat, &logger);
 
-		// If we have any public channel, the route hints from `filter_channels` will be empty.
-		// In that case we create a RouteHint on which we will push a single hop with the phantom
-		// route into the invoice, and let the sender find the path to the `real_node_pubkey`
+		// If we have any public channel, the route hints from `sort_and_filter_channels` will be 
+                // empty. In that case we create a RouteHint on which we will push a single hop with the 
+                // phantom route into the invoice, and let the sender find the path to the `real_node_pubkey`
 		// node by looking at our public channels.
 		if route_hints.is_empty() {
 			route_hints.push(RouteHint(vec![]))
@@ -485,7 +485,7 @@ fn _create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_has
 		invoice = invoice.amount_milli_satoshis(amt);
 	}
 
-	let route_hints = filter_channels(channels, amt_msat, &logger);
+	let route_hints = sort_and_filter_channels(channels, amt_msat, &logger);
 	for hint in route_hints {
 		invoice = invoice.private_route(hint);
 	}
@@ -504,8 +504,8 @@ fn _create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_has
 	}
 }
 
-/// Filters the `channels` for an invoice, and returns the corresponding `RouteHint`s to include
-/// in the invoice.
+/// Filters the `channels` for an invoice, and returns the three corresponding `RouteHint`s
+/// with the most inbound capacity to include in the invoice.
 ///
 /// The filtering is based on the following criteria:
 /// * Only one channel per counterparty node
@@ -514,7 +514,7 @@ fn _create_invoice_from_channelmanager_and_duration_since_epoch_with_payment_has
 ///   `is_usable` (i.e. the peer is connected).
 /// * If any public channel exists, the returned `RouteHint`s will be empty, and the sender will
 ///   need to find the path by looking at the public channels instead
-fn filter_channels<L: Deref>(
+fn sort_and_filter_channels<L: Deref>(
 	channels: Vec<ChannelDetails>, min_inbound_capacity_msat: Option<u64>, logger: &L
 ) -> Vec<RouteHint> where L::Target: Logger {
 	let mut filtered_channels: HashMap<PublicKey, ChannelDetails> = HashMap::new();
@@ -597,7 +597,7 @@ fn filter_channels<L: Deref>(
 	// the payment value and where we're currently connected to the channel counterparty.
 	// Even if we cannot satisfy both goals, always ensure we include *some* hints, preferring
 	// those which meet at least one criteria.
-	filtered_channels
+	let mut eligible_channels  = filtered_channels
 		.into_iter()
 		.map(|(_, channel)| channel)
 		.filter(|channel| {
@@ -629,8 +629,11 @@ fn filter_channels<L: Deref>(
 
 			include_channel
 		})
-		.map(route_hint_from_channel)
-		.collect::<Vec<RouteHint>>()
+                .collect::<Vec<ChannelDetails>>();
+
+        // Sort eligible channels by inbound capacity and return the top 3.
+        eligible_channels.sort_by(|a, b| b.inbound_capacity_msat.cmp(&a.inbound_capacity_msat));
+        eligible_channels.into_iter().take(3).map(route_hint_from_channel).collect::<Vec<RouteHint>>()
 }
 
 #[cfg(test)]
@@ -850,6 +853,26 @@ mod test {
 		scid_aliases.insert(chan_b.0.short_channel_id_alias.unwrap());
 		nodes[0].node.peer_disconnected(&nodes[1].node.get_our_node_id());
 		match_invoice_routes(Some(1_000_000_000), &nodes[0], scid_aliases);
+	}
+
+        #[test]
+	fn test_hints_limited_to_3() {
+		let chanmon_cfgs = create_chanmon_cfgs(5);
+		let node_cfgs = create_node_cfgs(5, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(5, &node_cfgs, &[None,None,None, None, None]);
+		let nodes = create_network(5, &node_cfgs, &node_chanmgrs);
+
+		let chan_1_0 = create_unannounced_chan_between_nodes_with_value(&nodes, 1, 0, 100_004, 0);
+		let chan_2_0 = create_unannounced_chan_between_nodes_with_value(&nodes, 2, 0, 100_003, 0);
+		let chan_3_0 = create_unannounced_chan_between_nodes_with_value(&nodes, 3, 0, 100_002, 0);
+		let _chan_4_0 = create_unannounced_chan_between_nodes_with_value(&nodes, 4, 0, 100_001, 0);
+
+		let mut scid_aliases = HashSet::new();
+		scid_aliases.insert(chan_1_0.0.short_channel_id_alias.unwrap());
+		scid_aliases.insert(chan_2_0.0.short_channel_id_alias.unwrap());
+		scid_aliases.insert(chan_3_0.0.short_channel_id_alias.unwrap());
+
+		match_invoice_routes(Some(500_000), &nodes[0], scid_aliases);
 	}
 
 	#[test]
